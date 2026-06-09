@@ -1,12 +1,26 @@
 import requests
 import pandas as pd
 import time
+import json
+from pathlib import Path
+
+from Authentication.auth_sis2 import obtener_auth
 
 # =========================
 # CONFIG
 # =========================
 
-TOKEN = "eyJhbGciOiJSUzI1NiIsImtpZCI6IjREWFlYTk9BbThmeC0zU2w2UUxEbTlFbGZ2R0c3amd3U0ZheDdyOWVLY2siLCJ0eXAiOiJKV1QifQ.eyJhdWQiOiI3YzdjNDUzMy0wOTkzLTRjODUtYjM2OC0zOTlkMTU1NDc2Y2QiLCJpc3MiOiJodHRwczovL3NpZ25pbi5jYXQuY29tL3RmcC80ZjBmMTlkMC1mNDRjLTRhMDMtYjhjYi1hYjMyN2JkMmIxMmIvYjJjXzFhX3AyX3YxX3NpZ25pbl9wcm9kL3YyLjAvIiwiZXhwIjoxNzc5MDM2MDcxLCJuYmYiOjE3NzkwMzI0NzEsImNsaWVudF9pZCI6IjdjN2M0NTMzLTA5OTMtNGM4NS1iMzY4LTM5OWQxNTU0NzZjZCIsImNhdGFmbHRuY2xhc3MiOiJETFIiLCJjYXRsb2dpbmlkIjoicjEyMGZjNDIiLCJjYXRyZWNpZCI6IlBTUC0wMDBCRUU3OSIsImNhdGFmbHRuY29kZSI6IjAwNSIsImNvdW50cnkiOiJDTCIsImVtYWlsX2FkZHJlc3MiOiJGYWJpYW4uQ2FzdGlsbG9AZmlubmluZy5jb20iLCJzdWIiOiIwNmQ2ZDFmYy03NjExLTQ0ZDYtYjVmZS0wYTMzNzQ0NmFmYTMiLCJuYW1lIjoiRmFiaWFuIENhc3RpbGxvIiwiZ2l2ZW5fbmFtZSI6IkZhYmlhbiIsImZhbWlseV9uYW1lIjoiQ2FzdGlsbG8iLCJjb21wYW55IjoiRklOTklORyBDSElMRSIsImNhdGN1cGlkIjoiOTk4OTc0NjEyMCIsInByZWZlcnJlZExhbmd1YWdlIjoiZXMiLCJjYXRhZmx0bm9yZ2NvZGUiOiJSMTIwIiwiY2F0dG9wbGV2ZWxvcmdjb2RlIjoiUjEyMCIsInRpZCI6IjRmMGYxOWQwLWY0NGMtNGEwMy1iOGNiLWFiMzI3YmQyYjEyYiIsInRmcCI6IkIyQ18xQV9QMl9WMV9TaWduSW5fUHJvZCIsImxhbmd1YWdlIjoiZXMiLCJhenAiOiI3YzdjNDUzMy0wOTkzLTRjODUtYjM2OC0zOTlkMTU1NDc2Y2QiLCJ2ZXIiOiIxLjAiLCJpYXQiOjE3NzkwMzI0NzF9.UCoV255v0uX1J0O0RFCi61VEunkzb7bFX2CX8Zl9KLYhFLWf-HmYIpaQqM3kWjpk639VbUMiclW4xcYCCBJYh1iPwbt-vO8UnmJQYGIkC-x5MoGW6xROHPOoIPIPb5U4XjnhLL85nUJCH8oVhuHNykwnA2HF4Xo93kQPQCA15cOsWQlRduRh3q3_KwAEjh7qfrudrct2TWZmx0_OdiX9OzbRToDHJpoLKdoVW3WHxl2mI1BiiVBrYBabHH6l9fgF4iTYQJ5xZi4jelxttJB3A8gW4w5Wx8-yPd10nSP4N_q9oTu3-4S76u2GN0-pW4DpEtfQw2x-L2B1AEwZfDMW1Q"
+AUTH_PATH = Path("Authentication/auth.json")
+
+
+def cargar_auth():
+
+    if not AUTH_PATH.exists():
+        print("No existe auth.json. Iniciando autenticación...")
+        return obtener_auth()
+
+    with open(AUTH_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 BASE_URL = "https://sis2.cat.com/api/ws-all/ServiceSoftwareFilesRemoteServices/serialNumber"
 
