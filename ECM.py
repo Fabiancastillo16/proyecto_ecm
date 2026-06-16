@@ -137,9 +137,9 @@ for serial in df_serials["SerialNumber"]:
 df_resultados = pd.DataFrame(resultados)
 
 df_resultados.to_csv(
-    "resultado_sis2.csv",
+    "resultado_sis22.csv",
     index=False,
     encoding="utf-8-sig"
 )
 
-print("Archivo generado: resultado_sis2.csv")
+print("Archivo generado: resultado_sis2.csv2")
