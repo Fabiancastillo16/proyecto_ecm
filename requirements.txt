@@ -1,0 +1,4 @@
+requests
+pandas
+playwright==1.48.0
+python-dotenv

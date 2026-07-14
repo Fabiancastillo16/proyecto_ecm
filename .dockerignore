@@ -1,0 +1,12 @@
+.env
+.env.example
+Authentication/auth.json
+Authentication/login_debug.png
+Authentication/__pycache__
+__pycache__
+*.pyc
+.git
+.gitignore
+Results/*.csv
+docs
+README.md

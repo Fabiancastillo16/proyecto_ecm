@@ -1,0 +1,5 @@
+# Dependencias adicionales solo para el despliegue en la nube (subida a ADLS
+# usando la identidad administrada del recurso). No se necesitan para correr
+# el proyecto en local.
+azure-identity
+azure-storage-file-datalake

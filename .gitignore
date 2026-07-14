@@ -1,0 +1,13 @@
+# Credenciales y secretos - NUNCA subir esto a git
+.env
+Authentication/auth.json
+Authentication/login_debug.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Resultados (opcional, descomenta si no quieres versionar los CSV de salida)
+# Results/*.csv
