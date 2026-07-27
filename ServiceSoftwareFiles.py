@@ -67,10 +67,19 @@ def _obtener_sesion_vigente():
         return _session_actual
 
 
-def _forzar_relogin():
-    """Reautentica una sola vez aunque varios threads lo pidan a la vez."""
+def _forzar_relogin(sesion_que_fallo):
+    """
+    Reautentica, pero solo si nadie más ya lo hizo mientras este thread
+    esperaba el lock. 'sesion_que_fallo' es la sesión que este thread
+    intentó usar y le devolvió 401/403 — si _session_actual ya cambió
+    (otro thread ya la renovó), reutilizamos esa en vez de loguear de nuevo.
+    """
     global _session_actual
     with _auth_lock:
+        if _session_actual is not None and _session_actual is not sesion_que_fallo:
+            # Otro thread ya renovó la sesión mientras esperábamos el lock
+            return _session_actual
+
         print("Sesión expirada, reautenticando...")
         auth_data = cargar_auth(forzar_relogin=True)
         _session_actual = construir_sesion(auth_data)
@@ -86,9 +95,10 @@ def consultar_serial(serial):
     try:
         response = session.get(url, timeout=30)
 
-        # Token vencido a mitad de la corrida -> reautentica una vez y reintenta
+        # Token vencido a mitad de la corrida -> reautentica (una sola vez
+        # por sesión realmente vencida, no una vez por thread) y reintenta
         if response.status_code in (401, 403):
-            session = _forzar_relogin()
+            session = _forzar_relogin(session)
             response = session.get(url, timeout=30)
 
         print(f"{serial}: STATUS {response.status_code}")
@@ -159,18 +169,42 @@ def _obtener_file_system_client():
 def cargar_equipos():
     """
     Carga la lista de equipos a consultar.
-      - Si hay config de ADLS (ADLS_STORAGE_ACCOUNT + ADLS_FILESYSTEM),
-        descarga el/los CSV que encuentre dentro de ADLS_INPUT_DIRECTORY
-        (la carpeta donde cae el resultado de la query) y los concatena.
-      - Si no hay config de ADLS (ej. corriendo en tu máquina local),
-        usa el Equipos.csv local de siempre.
+      - Si hay config de ADLS (ADLS_STORAGE_ACCOUNT + ADLS_FILESYSTEM):
+          - Si ADLS_INPUT_FILENAME está definida, descarga EXACTAMENTE ese
+            archivo (ruta = ADLS_INPUT_DIRECTORY/ADLS_INPUT_FILENAME) y
+            nada más. Es el modo recomendado para producción.
+          - Si ADLS_INPUT_FILENAME NO está definida, busca todos los .csv
+            dentro de ADLS_INPUT_DIRECTORY, valida que cada uno tenga la
+            columna 'SerialNumber' antes de incluirlo (descarta con
+            advertencia los que no la tengan), y concatena+deduplica.
+      - Si no hay config de ADLS (ej. corriendo en tu máquina local), usa
+        el Equipos.csv local de siempre.
     """
     file_system_client = _obtener_file_system_client()
     input_directory = os.getenv("ADLS_INPUT_DIRECTORY")
+    input_filename = os.getenv("ADLS_INPUT_FILENAME")
 
     if file_system_client is None or not input_directory:
         print("Cargando Equipos.csv local...")
         return pd.read_csv("Equipos.csv")
+
+    import io
+
+    if input_filename:
+        relative_path = f"{input_directory}/{input_filename}".strip("/")
+        print(f"Descargando archivo de equipos (ruta fija): {relative_path}")
+        file_client = file_system_client.get_file_client(relative_path)
+        contenido = file_client.download_file().readall()
+        df_equipos = pd.read_csv(io.BytesIO(contenido))
+
+        if "SerialNumber" not in df_equipos.columns:
+            raise ValueError(
+                f"'{relative_path}' no tiene una columna 'SerialNumber'. "
+                "Revisa que ADLS_INPUT_FILENAME apunte al archivo correcto."
+            )
+
+        print(f"Equipos cargados desde ADLS: {len(df_equipos)}")
+        return df_equipos
 
     print(f"Buscando archivos de equipos en ADLS: {input_directory}")
 
@@ -187,16 +221,27 @@ def cargar_equipos():
 
     dataframes = []
     for path in archivos_csv:
-        print(f"  Descargando: {path}")
         file_client = file_system_client.get_file_client(path)
         contenido = file_client.download_file().readall()
+        df = pd.read_csv(io.BytesIO(contenido))
 
-        import io
-        dataframes.append(pd.read_csv(io.BytesIO(contenido)))
+        if "SerialNumber" not in df.columns:
+            print(
+                f"  ADVERTENCIA: se descarta '{path}' — no tiene columna "
+                "'SerialNumber' (no parece ser un archivo de equipos)."
+            )
+            continue
+
+        print(f"  Descargando: {path} ({len(df)} filas)")
+        dataframes.append(df)
+
+    if not dataframes:
+        raise ValueError(
+            f"Había .csv en '{input_directory}', pero ninguno tiene columna "
+            "'SerialNumber' — no hay ningún archivo válido de equipos."
+        )
 
     df_equipos = pd.concat(dataframes, ignore_index=True)
-
-    # Por si la query exporta el mismo equipo repetido en más de un archivo
     df_equipos = df_equipos.drop_duplicates(subset=["SerialNumber"])
 
     print(f"Equipos cargados desde ADLS: {len(df_equipos)}")
@@ -207,7 +252,7 @@ def subir_a_adls_si_corresponde(local_path: Path):
     """
     Si hay variables de entorno de ADLS configuradas, sube el resultado a
     ADLS_OUTPUT_DIRECTORY. Si no están configuradas (ej. corriendo en tu
-    máquina local), no hace nada: el CSV se queda solo en Results/.
+    máquina local), no hace nada.
     """
     file_system_client = _obtener_file_system_client()
     directory = os.getenv("ADLS_OUTPUT_DIRECTORY", "")

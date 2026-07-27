@@ -18,5 +18,6 @@ RUN mkdir -p Results
 
 # No se copia .env: en la nube las credenciales llegan como variables de
 # entorno inyectadas por Container Apps Jobs desde Key Vault, no desde archivo.
+ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "ServiceSoftwareFiles.py"]
