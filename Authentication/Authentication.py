@@ -10,7 +10,7 @@ from playwright.sync_api import sync_playwright
 # CREDENCIALES (desde .env, nunca hardcodeadas ni versionadas)
 # =========================
 
-load_dotenv()
+load_dotenv(encoding="utf-8-sig")  # utf-8-sig tolera un BOM inicial si existe (Windows suele agregarlo al guardar)
 
 SIS2_USERNAME = os.getenv("SIS2_USERNAME")
 SIS2_PASSWORD = os.getenv("SIS2_PASSWORD")
@@ -32,13 +32,21 @@ def obtener_auth(headless: bool = True):
 
     with sync_playwright() as p:
 
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context()
+        browser = p.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            )
+        )
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
         page = context.new_page()
 
-        # ==========================================
-        # CAPTURAR REQUESTS Y BEARER
-        # ==========================================
         def capture_request(request):
             nonlocal bearer_token
             auth = request.headers.get("authorization")
@@ -47,24 +55,12 @@ def obtener_auth(headless: bool = True):
 
         page.on("request", capture_request)
 
-        # ==========================================
-        # ABRIR SIS2
-        # ==========================================
         print("Abriendo SIS2...")
-        # "networkidle" se cuelga en sitios con polling/websockets de fondo
-        # (muy común). "domcontentloaded" + timeout generoso es más confiable.
         page.goto("https://sis2.cat.com", wait_until="domcontentloaded", timeout=60000)
 
-        # ==========================================
-        # LLENAR LOGIN AUTOMÁTICAMENTE
-        # ==========================================
-        print("Rellenando formulario de login...")
+        _aceptar_cookies_si_aparece(page)
         _autocompletar_login(page)
 
-        # ==========================================
-        # ESPERAR LOGIN COMPLETO
-        # ==========================================
-        print("Esperando confirmación de login...")
         timeout_seconds = 60
         start = time.time()
 
@@ -72,29 +68,29 @@ def obtener_auth(headless: bool = True):
             cookies = context.cookies()
             cookie_dict = {c["name"]: c["value"] for c in cookies}
 
-            tiene_login = "Sis2_Login" in cookie_dict
-            tiene_refresh = "Sis2_Refresh" in cookie_dict
-
-            if bearer_token and tiene_login and tiene_refresh:
+            if bearer_token and "Sis2_Login" in cookie_dict and "Sis2_Refresh" in cookie_dict:
                 break
 
             if time.time() - start > timeout_seconds:
                 debug_path = "Authentication/login_debug.png"
-                page.screenshot(path=debug_path)
+                try:
+                    print(f"DIAGNOSTICO - URL actual: {page.url}")
+                    print(f"DIAGNOSTICO - Titulo de pagina: {page.title()}")
+                    print(f"DIAGNOSTICO - Cookies presentes: {list(cookie_dict.keys())}")
+                    print(f"DIAGNOSTICO - Bearer capturado: {bearer_token is not None}")
+                    page.screenshot(path=debug_path, full_page=True)
+                except Exception as diag_error:
+                    print(f"DIAGNOSTICO - Error obteniendo diagnostico: {diag_error}")
                 browser.close()
                 raise TimeoutError(
                     f"No se completó el login en {timeout_seconds}s. "
-                    f"Revisa {debug_path} para ver en qué pantalla quedó "
-                    "(útil para ajustar los selectores de _autocompletar_login)."
+                    f"Revisa {debug_path} para ver en qué pantalla quedó."
                 )
 
             time.sleep(1)
 
         print("Login completado")
 
-        # ==========================================
-        # CREAR JSON
-        # ==========================================
         auth_data = {
             "bearer": bearer_token,
             "cookies": {
@@ -107,24 +103,37 @@ def obtener_auth(headless: bool = True):
         with open(auth_path, "w", encoding="utf-8") as f:
             json.dump(auth_data, f, indent=4)
 
-        print("Archivo auth.json creado")
-
         browser.close()
-        print("Proceso de autenticación finalizado")
 
         return auth_data
+
+
+def _aceptar_cookies_si_aparece(page, timeout=6000):
+    """
+    Cierra el banner de consentimiento de cookies (OneTrust) si aparece.
+    No es bloqueante: si no aparece, sigue sin hacer nada.
+    """
+    accept_selectors = [
+        "#onetrust-accept-btn-handler",
+        "button:has-text('I Accept')",
+        "button:has-text('Accept')",
+        "button:has-text('Aceptar')",
+    ]
+    for selector in accept_selectors:
+        try:
+            locator = page.locator(selector).first
+            locator.wait_for(state="visible", timeout=timeout)
+            locator.click()
+            return
+        except Exception:
+            continue
 
 
 def _autocompletar_login(page):
     """
     Llena el formulario de login de Azure AD B2C (usado por SIS2/Caterpillar).
-    Es un flujo en DOS PASOS:
-      1) Pantalla de usuario -> botón "Continue"
-      2) Pantalla de password -> botón "Sign in" / "Continue"
-    Prueba varios selectores porque las páginas B2C personalizadas a veces
-    difieren un poco en nombres de campo (esto es normal en este tipo de login).
+    Es un flujo en dos pantallas: usuario -> Continue -> password -> enviar.
     """
-
     email_selectors = [
         "#signInName",
         "input[type='email']",
@@ -150,14 +159,14 @@ def _autocompletar_login(page):
         "button[type='submit']",
     ]
 
-    # PASO 1: usuario
     email_field = _esperar_primero(page, email_selectors)
     email_field.fill(SIS2_USERNAME)
 
     continue_button = _esperar_primero(page, continue_selectors)
     continue_button.click()
 
-    # PASO 2: password (aparece recién después de darle Continue)
+    _aceptar_cookies_si_aparece(page)
+
     password_field = _esperar_primero(page, password_selectors, timeout=20000)
     password_field.fill(SIS2_PASSWORD)
 
@@ -177,13 +186,9 @@ def _esperar_primero(page, selectors, timeout=15000):
             continue
     raise RuntimeError(
         f"No se encontró ningún campo con estos selectores: {selectors}. "
-        "Corre obtener_auth(headless=False) una vez y usa el inspector de "
-        "Playwright (o clic derecho > Inspeccionar en el navegador) para "
-        "ver el id/name real del campo, luego agrégalo a la lista."
+        "Corre obtener_auth(headless=False) para ver el HTML real del formulario."
     )
 
 
 if __name__ == "__main__":
-    # La primera vez, corre con headless=False para ver el proceso y
-    # confirmar que los selectores funcionan en tu pantalla real.
     obtener_auth(headless=False)

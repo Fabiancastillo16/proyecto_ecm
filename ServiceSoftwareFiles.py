@@ -101,9 +101,8 @@ def consultar_serial(serial):
             session = _forzar_relogin(session)
             response = session.get(url, timeout=30)
 
-        print(f"{serial}: STATUS {response.status_code}")
-
         if response.status_code != 200:
+            print(f"{serial}: STATUS {response.status_code}")
             return [{
                 "serial": serial,
                 "status": response.status_code,
@@ -248,26 +247,206 @@ def cargar_equipos():
     return df_equipos
 
 
-def subir_a_adls_si_corresponde(local_path: Path):
-    """
-    Si hay variables de entorno de ADLS configuradas, sube el resultado a
-    ADLS_OUTPUT_DIRECTORY. Si no están configuradas (ej. corriendo en tu
-    máquina local), no hace nada.
-    """
-    file_system_client = _obtener_file_system_client()
-    directory = os.getenv("ADLS_OUTPUT_DIRECTORY", "")
+# =========================
+# SALIDA: Azure SQL (epcat.ecm_cat_software_number)
+# =========================
 
-    if file_system_client is None:
+SQL_SERVER = os.getenv("SQL_SERVER", "prexternalcatsource.database.windows.net")
+SQL_DATABASE = os.getenv("SQL_DATABASE", "DA_External_Sources")
+SQL_SCHEMA = "epcat"
+SQL_TABLE = "ecm_cat_software_number"
+
+# Campos que definen si "cambió algo" para un mismo ECM (ver CLAVE_ECM
+# más abajo para cómo se identifica "el mismo ECM" entre corridas)
+CAMPOS_COMPARABLES = [
+    "software_part_number",
+    "release_date",
+    "file_size",
+    "latest_available",
+    "service_file_id",
+]
+
+
+def _clave_ecm(fila_o_row, es_row_sql=False):
+    """
+    Identifica de forma única a un ECM físico dentro de un mismo equipo.
+    Un equipo puede tener más de un ECM con el mismo 'ecm_name' (ej. dos
+    módulos "ENGINE" distintos) — por eso 'ecm_name' solo no alcanza como
+    clave, y se agrega 'flash_file' (el archivo base identifica al
+    componente físico, distinto entre esos dos ECMs aunque compartan
+    nombre).
+    """
+    if es_row_sql:
+        return (fila_o_row.serial, fila_o_row.ecm_name, fila_o_row.flash_file)
+    return (fila_o_row.get("serial"), fila_o_row.get("ecm_name"), fila_o_row.get("flash_file"))
+
+
+def _sql_habilitado():
+    """SQL_SERVER/SQL_DATABASE ya tienen default de producción, así que
+    esto siempre es True salvo que alguien los desactive explícitamente
+    con SQL_OUTPUT_DISABLED=1 (útil para correr solo en modo local/CSV)."""
+    return os.getenv("SQL_OUTPUT_DISABLED") != "1"
+
+
+def obtener_conexion_sql():
+    """
+    Conecta a Azure SQL usando un login SQL tradicional (usuario/contraseña),
+    definido en SQL_USERNAME/SQL_PASSWORD (.env). Se eligió este método en
+    vez de identidad administrada porque el servidor SQL no tiene el
+    permiso "Directory Readers" necesario para validar tokens de Azure AD
+    (requiere un Global Administrator de Azure AD para asignarlo, y no fue
+    posible obtenerlo en el corto plazo — ver docs para el detalle).
+    """
+    import pyodbc
+
+    sql_username = os.getenv("SQL_USERNAME")
+    sql_password = os.getenv("SQL_PASSWORD")
+
+    if not sql_username or not sql_password:
+        raise RuntimeError(
+            "Faltan credenciales de SQL. Define SQL_USERNAME y SQL_PASSWORD en tu .env."
+        )
+
+    conn_str = (
+        "DRIVER={ODBC Driver 17 for SQL Server};"
+        f"SERVER={SQL_SERVER};DATABASE={SQL_DATABASE};"
+        f"UID={sql_username};PWD={sql_password};"
+    )
+    return pyodbc.connect(conn_str)
+
+
+def asegurar_tabla_sql(conn):
+    """Crea la tabla de historial de cambios si todavía no existe."""
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.tables t
+            JOIN sys.schemas s ON t.schema_id = s.schema_id
+            WHERE s.name = '{SQL_SCHEMA}' AND t.name = '{SQL_TABLE}'
+        )
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = '{SQL_SCHEMA}')
+                EXEC('CREATE SCHEMA {SQL_SCHEMA}');
+
+            CREATE TABLE {SQL_SCHEMA}.{SQL_TABLE} (
+                id BIGINT IDENTITY(1,1) PRIMARY KEY,
+                serial NVARCHAR(50) NOT NULL,
+                ecm_name NVARCHAR(200) NULL,
+                software_part_number NVARCHAR(100) NULL,
+                flash_file NVARCHAR(200) NULL,
+                release_date NVARCHAR(50) NULL,
+                file_size BIGINT NULL,
+                latest_available NVARCHAR(20) NULL,
+                service_file_id NVARCHAR(100) NULL,
+                fecha_corrida DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+            );
+
+            CREATE INDEX IX_{SQL_TABLE}_serial_ecm
+                ON {SQL_SCHEMA}.{SQL_TABLE} (serial, ecm_name, flash_file, fecha_corrida DESC);
+        END
+    """)
+    conn.commit()
+
+
+def _normalizar_para_comparar(valor):
+    """
+    Convierte un valor a su representación de texto para comparar de forma
+    consistente, sin importar si llegó como bool/int/str desde la API o
+    como texto desde SQL (ej. NVARCHAR siempre vuelve como str, mientras
+    que la API puede entregar True/False como bool real) — sin esto, se
+    generaban falsos positivos de "cambio" en casi cada corrida.
+    """
+    if valor is None:
+        return None
+    return str(valor)
+
+
+def cargar_ultimo_estado_sql(conn):
+    """
+    Devuelve un diccionario {(serial, ecm_name, flash_file): (campos
+    comparables...)} con el último estado conocido de cada ECM físico,
+    para poder detectar qué cambió en esta corrida.
+    """
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT serial, ecm_name, software_part_number, flash_file,
+               release_date, file_size, latest_available, service_file_id
+        FROM (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY serial, ecm_name, flash_file
+                       ORDER BY fecha_corrida DESC
+                   ) AS rn
+            FROM {SQL_SCHEMA}.{SQL_TABLE}
+        ) t
+        WHERE rn = 1
+    """)
+
+    estado = {}
+    for row in cursor.fetchall():
+        clave = _clave_ecm(row, es_row_sql=True)
+        estado[clave] = tuple(
+            _normalizar_para_comparar(getattr(row, campo)) for campo in CAMPOS_COMPARABLES
+        )
+
+    return estado
+
+
+def guardar_cambios_en_sql(filas):
+    """
+    Compara 'filas' (resultados exitosos de esta corrida) contra el último
+    estado conocido en SQL, e inserta SOLO las que son nuevas o cambiaron.
+    Las filas de error (sin ecm_name, ver consultar_serial) no se guardan
+    aquí — solo quedan en la consola de esta corrida.
+    """
+    if not _sql_habilitado():
         return
 
-    relative_path = f"{directory}/{local_path.name}".strip("/")
-    file_client = file_system_client.get_file_client(relative_path)
+    conn = obtener_conexion_sql()
+    try:
+        asegurar_tabla_sql(conn)
+        ultimo_estado = cargar_ultimo_estado_sql(conn)
 
-    with open(local_path, "rb") as f:
-        contenido = f.read()
+        filas_a_insertar = []
+        for fila in filas:
+            if "ecm_name" not in fila:
+                continue  # es una fila de error, no de resultado real
 
-    file_client.upload_data(contenido, overwrite=True)
-    print(f"Subido a ADLS: {relative_path}")
+            clave = _clave_ecm(fila)
+            valores_actuales = tuple(
+                _normalizar_para_comparar(fila.get(campo)) for campo in CAMPOS_COMPARABLES
+            )
+
+            if ultimo_estado.get(clave) != valores_actuales:
+                filas_a_insertar.append(fila)
+
+        if not filas_a_insertar:
+            print("Sin cambios respecto al último estado conocido en SQL.")
+            return
+
+        cursor = conn.cursor()
+        cursor.fast_executemany = True
+        cursor.executemany(
+            f"""
+            INSERT INTO {SQL_SCHEMA}.{SQL_TABLE}
+                (serial, ecm_name, software_part_number, flash_file,
+                 release_date, file_size, latest_available, service_file_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    f["serial"], f.get("ecm_name"), f.get("software_part_number"),
+                    f.get("flash_file"), f.get("release_date"), f.get("file_size"),
+                    f.get("latest_available"), f.get("service_file_id"),
+                )
+                for f in filas_a_insertar
+            ],
+        )
+        conn.commit()
+        print(f"Insertadas {len(filas_a_insertar)} filas nuevas/cambiadas en "
+              f"{SQL_SCHEMA}.{SQL_TABLE}")
+    finally:
+        conn.close()
 
 
 def main():
@@ -284,13 +463,24 @@ def main():
 
     df_resultados = pd.DataFrame(resultados)
 
+    errores = df_resultados["status"].notna().sum() if "status" in df_resultados.columns else 0
+    exitosos = len(df_resultados) - errores
+    print(f"Consultas: {exitosos} filas exitosas, {errores} con error")
+
+    if len(df_resultados) > 0 and exitosos == 0:
+        print("ERROR: ninguna consulta fue exitosa (posible falla de autenticación o de red).")
+        import sys
+        sys.exit(1)
+
+    # Respaldo local de cada corrida (útil para debug), el destino
+    # definitivo del resultado es la tabla SQL (ver guardar_cambios_en_sql)
     output_path = Path("Results/resultado_sis2.csv")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     df_resultados.to_csv(output_path, index=False, encoding="utf-8-sig")
     print(f"Archivo generado: {output_path} ({len(df_resultados)} filas)")
 
-    subir_a_adls_si_corresponde(output_path)
+    guardar_cambios_en_sql(resultados)
 
 
 if __name__ == "__main__":

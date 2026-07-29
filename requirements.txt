@@ -1,4 +1,7 @@
 requests
 pandas
-playwright==1.48.0
+playwright
 python-dotenv
+azure-identity
+azure-storage-file-datalake
+pyodbc
